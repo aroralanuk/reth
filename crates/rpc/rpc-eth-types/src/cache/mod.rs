@@ -11,7 +11,6 @@ use reth_execution_types::Chain;
 use reth_primitives::{Receipt, SealedBlockWithSenders, TransactionSigned};
 use reth_storage_api::{BlockReader, StateProviderFactory, TransactionVariant};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
-use revm::primitives::{BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId};
 use schnellru::{ByLength, Limiter};
 use std::{
     future::Future,
@@ -44,7 +43,7 @@ type BlockWithSendersResponseSender =
 type ReceiptsResponseSender = oneshot::Sender<ProviderResult<Option<Arc<Vec<Receipt>>>>>;
 
 /// The type that can send the response to a requested env
-type EnvResponseSender = oneshot::Sender<ProviderResult<(CfgEnvWithHandlerCfg, BlockEnv)>>;
+type HeaderResponseSender = oneshot::Sender<ProviderResult<Header>>;
 
 type BlockLruCache<L> = MultiConsumerLruCache<
     B256,
@@ -56,8 +55,8 @@ type BlockLruCache<L> = MultiConsumerLruCache<
 type ReceiptsLruCache<L> =
     MultiConsumerLruCache<B256, Arc<Vec<Receipt>>, L, ReceiptsResponseSender>;
 
-type EnvLruCache<L> =
-    MultiConsumerLruCache<B256, (CfgEnvWithHandlerCfg, BlockEnv), L, EnvResponseSender>;
+type HeaderLruCache<L> =
+    MultiConsumerLruCache<B256, Header, L, HeaderResponseSender>;
 
 /// Provides async access to cached eth data
 ///
@@ -84,7 +83,7 @@ impl EthStateCache {
             provider,
             full_block_cache: BlockLruCache::new(max_blocks, "blocks"),
             receipts_cache: ReceiptsLruCache::new(max_receipts, "receipts"),
-            evm_env_cache: EnvLruCache::new(max_envs, "evm_env"),
+            header_cache: HeaderLruCache::new(max_envs, "header"),
             action_tx: to_service.clone(),
             action_rx: UnboundedReceiverStream::new(rx),
             action_task_spawner,
@@ -188,16 +187,15 @@ impl EthStateCache {
         Ok(block.zip(receipts))
     }
 
-    /// Requests the evm env config for the block hash.
+    /// Requests the header for the block hash.
     ///
-    /// Returns an error if the corresponding header (required for populating the envs) was not
-    /// found.
-    pub async fn get_evm_env(
+    /// Returns an error if the header was not found.
+    pub async fn get_header(
         &self,
         block_hash: B256,
-    ) -> ProviderResult<(CfgEnvWithHandlerCfg, BlockEnv)> {
+    ) -> ProviderResult<Header> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(CacheAction::GetEnv { block_hash, response_tx });
+        let _ = self.to_service.send(CacheAction::GetHeader { block_hash, response_tx });
         rx.await.map_err(|_| ProviderError::CacheServiceUnavailable)?
     }
 }
@@ -225,11 +223,11 @@ pub(crate) struct EthStateCacheService<
     EvmConfig,
     LimitBlocks = ByLength,
     LimitReceipts = ByLength,
-    LimitEnvs = ByLength,
+    LimitHeaders = ByLength,
 > where
     LimitBlocks: Limiter<B256, Arc<SealedBlockWithSenders>>,
     LimitReceipts: Limiter<B256, Arc<Vec<Receipt>>>,
-    LimitEnvs: Limiter<B256, (CfgEnvWithHandlerCfg, BlockEnv)>,
+    LimitHeaders: Limiter<B256, Header>,
 {
     /// The type used to lookup data from disk
     provider: Provider,
@@ -237,8 +235,8 @@ pub(crate) struct EthStateCacheService<
     full_block_cache: BlockLruCache<LimitBlocks>,
     /// The LRU cache for full blocks grouped by their hash.
     receipts_cache: ReceiptsLruCache<LimitReceipts>,
-    /// The LRU cache for revm environments
-    evm_env_cache: EnvLruCache<LimitEnvs>,
+    /// The LRU cache for headers
+    header_cache: HeaderLruCache<LimitHeaders>,
     /// Sender half of the action channel.
     action_tx: UnboundedSender<CacheAction>,
     /// Receiver half of the action channel.
@@ -341,7 +339,7 @@ where
     fn update_cached_metrics(&self) {
         self.full_block_cache.update_cached_metrics();
         self.receipts_cache.update_cached_metrics();
-        self.evm_env_cache.update_cached_metrics();
+        self.header_cache.update_cached_metrics();
     }
 }
 
@@ -421,37 +419,29 @@ where
                                 }));
                             }
                         }
-                        CacheAction::GetEnv { block_hash, response_tx } => {
+                        CacheAction::GetHeader { block_hash, response_tx } => {
                             // check if env data is cached
-                            if let Some(env) = this.evm_env_cache.get(&block_hash).cloned() {
-                                let _ = response_tx.send(Ok(env));
+                            if let Some(header) = this.header_cache.get(&block_hash).cloned() {
+                                let _ = response_tx.send(Ok(header));
                                 continue
                             }
 
-                            // env data is not in the cache, request it if this is the first
+                            // header data is not in the cache, request it if this is the first
                             // consumer
-                            if this.evm_env_cache.queue(block_hash, response_tx) {
+                            if this.header_cache.queue(block_hash, response_tx) {
                                 let provider = this.provider.clone();
                                 let action_tx = this.action_tx.clone();
                                 let rate_limiter = this.rate_limiter.clone();
-                                let evm_config = this.evm_config.clone();
                                 this.action_task_spawner.spawn_blocking(Box::pin(async move {
                                     // Acquire permit
                                     let _permit = rate_limiter.acquire().await;
-                                    let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(
-                                        CfgEnv::default(),
-                                        SpecId::LATEST,
-                                    );
-                                    let mut block_env = BlockEnv::default();
                                     let res = provider
-                                        .fill_env_at(
-                                            &mut cfg,
-                                            &mut block_env,
-                                            block_hash.into(),
-                                            evm_config,
-                                        )
-                                        .map(|_| (cfg, block_env));
-                                    let _ = action_tx.send(CacheAction::EnvResult {
+                                        .header((&block_hash).into())
+                                        .and_then(|maybe_header| {
+                                            maybe_header
+                                                .ok_or_else(|| ProviderError::HeaderNotFound(block_hash.into()))
+                                        });
+                                    let _ = action_tx.send(CacheAction::HeaderResult {
                                         block_hash,
                                         res: Box::new(res),
                                     });
@@ -472,18 +462,18 @@ where
                                 this.on_new_block(block_hash, Err(e));
                             }
                         },
-                        CacheAction::EnvResult { block_hash, res } => {
+                        CacheAction::HeaderResult { block_hash, res } => {
                             let res = *res;
-                            if let Some(queued) = this.evm_env_cache.remove(&block_hash) {
+                            if let Some(queued) = this.header_cache.remove(&block_hash) {
                                 // send the response to queued senders
                                 for tx in queued {
                                     let _ = tx.send(res.clone());
                                 }
                             }
 
-                            // cache good env data
+                            // cache good header data
                             if let Ok(data) = res {
-                                this.evm_env_cache.insert(block_hash, data);
+                                this.header_cache.insert(block_hash, data);
                             }
                         }
                         CacheAction::CacheNewCanonicalChain { chain_change } => {
@@ -528,9 +518,9 @@ enum CacheAction {
         block_hash: B256,
         response_tx: BlockWithSendersResponseSender,
     },
-    GetEnv {
+    GetHeader {
         block_hash: B256,
-        response_tx: EnvResponseSender,
+        response_tx: HeaderResponseSender,
     },
     GetReceipts {
         block_hash: B256,
@@ -544,9 +534,9 @@ enum CacheAction {
         block_hash: B256,
         res: ProviderResult<Option<Arc<Vec<Receipt>>>>,
     },
-    EnvResult {
+    HeaderResult {
         block_hash: B256,
-        res: Box<ProviderResult<(CfgEnvWithHandlerCfg, BlockEnv)>>,
+        res: Box<ProviderResult<Header>>,
     },
     CacheNewCanonicalChain {
         chain_change: ChainChange,

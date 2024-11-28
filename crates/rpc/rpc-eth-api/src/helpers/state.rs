@@ -9,7 +9,7 @@ use alloy_serde::JsonStorageKey;
 use futures::Future;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_errors::RethError;
-use reth_evm::ConfigureEvmEnv;
+use reth_evm::{ConfigureEvmEnv, provider::EvmEnvProvider};
 use reth_provider::{
     BlockIdReader, BlockNumReader, ChainSpecProvider, StateProvider, StateProviderBox,
     StateProviderFactory,
@@ -222,6 +222,9 @@ pub trait LoadState:
     where
         Self: LoadPendingBlock + SpawnBlocking,
     {
+        let evm_config = self.evm_config().clone();
+        let provider = RpcNodeCore::provider(self).clone();
+
         async move {
             if at.is_pending() {
                 let PendingBlockEnv { cfg, block_env, origin } =
@@ -229,14 +232,20 @@ pub trait LoadState:
                 Ok((cfg, block_env, origin.state_block_id()))
             } else {
                 // Use cached values if there is no pending block
-                let block_hash = RpcNodeCore::provider(self)
+                let block_hash = provider
                     .block_hash_for_id(at)
                     .map_err(Self::Error::from_eth_err)?
                     .ok_or(EthApiError::HeaderNotFound(at))?;
-                let (cfg, env) = self
+
+
+                let header = self
                     .cache()
-                    .get_evm_env(block_hash)
+                    .get_header(block_hash)
                     .await
+                    .map_err(Self::Error::from_eth_err)?;
+
+                let (cfg, env) = provider
+                    .env_with_header(&header, evm_config)
                     .map_err(Self::Error::from_eth_err)?;
                 Ok((cfg, env, block_hash.into()))
             }
